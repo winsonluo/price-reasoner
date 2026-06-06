@@ -1,16 +1,24 @@
 import typer
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+import json
+
 from price_reasoner.config import Config
 from price_reasoner.data_sources.mock import MockDataSource
 from price_reasoner.data_sources.competitor_mock import MockCompetitorDataSource
+from price_reasoner.data_sources.ecommerce import WebScrapingDataSource
 from price_reasoner.models import AnalysisReport, CompetitorReport
 from price_reasoner.report import ReportGenerator
 from price_reasoner.competitor_analyzer import CompetitorAnalyzer
 from price_reasoner.competitor_report import CompetitorReportGenerator
+from price_reasoner.feishu_output import FeishuReportGenerator
 
 app = typer.Typer()
 config = Config()
+
+
+def _parse_date(s: str) -> date:
+    return date.fromisoformat(s) if s else date.today() - timedelta(days=365)
 
 
 @app.command()
@@ -23,8 +31,8 @@ def analyze(
     """Analyze commodity price trends and generate attribution report"""
     typer.echo(f"Starting analysis for {commodity} ({start_date} ~ {end_date})")
 
-    start = date.fromisoformat(start_date)
-    end = date.fromisoformat(end_date)
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
 
     ds = MockDataSource()
     stages = ds.get_price_stages(commodity, start, end)
@@ -133,9 +141,68 @@ def competitor(
 
 
 @app.command()
+def scrape(
+    url: str = typer.Option(..., "--url", help="Product URL from JD/Taobao/Tmall/1688"),
+    days: int = typer.Option(90, "--days", "-d", help="Number of days of history to fetch"),
+    delay: float = typer.Option(2.0, "--delay", help="Seconds between requests (rate limit)"),
+    output: str = typer.Option("price_history.json", "--output", "-o", help="Output JSON file"),
+    feishu: bool = typer.Option(False, "--feishu", help="Also push to Feishu document"),
+):
+    """
+    Scrape real price history from e-commerce sites (JD/Taobao/Tmall/1688).
+
+    Examples:
+      price-reasoner scrape --url "https://item.jd.com/100012043456.html" -d 90
+      price-reasoner scrape --url "https://detail.tmall.com/item.htm?id=..." --feishu
+    """
+    typer.echo(f"Scraping: {url}")
+    ds = WebScrapingDataSource(delay=delay)
+
+    # 自动识别平台并抓取
+    parsed = ds.parse_product_url(url)
+    typer.echo(f"Detected: {parsed['platform']} / ID: {parsed['product_id']}")
+
+    prices = ds.get_price_history_auto(url, days=days)
+    if not prices:
+        typer.echo("No price data collected (site may block scraping).")
+        return
+
+    typer.echo(f"Collected {len(prices)} price points.")
+
+    # 保存 JSON
+    import json
+    data = {
+        "platform": parsed["platform"],
+        "product_id": parsed["product_id"],
+        "original_url": url,
+        "count": len(prices),
+        "price_points": [
+            {"date": p.date.isoformat(), "price": p.price, "currency": p.currency, "source": p.source}
+            for p in prices
+        ],
+    }
+    Path(output).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"Data saved: {output}")
+
+    # 可选：推送到飞书
+    if feishu:
+        try:
+            from price_reasoner.feishu_output import FeishuReportGenerator
+            feishu_gen = FeishuReportGenerator()
+            doc_url = feishu_gen._run(["docs", "+create",
+                "--Title", f"价格走势：{parsed['product_id']}",
+                "--markdown", f"@./{output}",
+                "--doc-format", "markdown",
+            ])
+            typer.echo(f"Feishu doc: {doc_url}")
+        except Exception as e:
+            typer.echo(f"[WARNING] Feishu output failed: {e}")
+
+
+@app.command()
 def version():
     """Show version info"""
-    typer.echo("price-reasoner v0.2.0")
+    typer.echo("price-reasoner v0.3.0")
 
 
 if __name__ == "__main__":
